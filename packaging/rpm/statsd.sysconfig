@@ -1,0 +1,3 @@
+# Configuration file for statsd
+
+# CONFIG=/etc/statsd.conf
