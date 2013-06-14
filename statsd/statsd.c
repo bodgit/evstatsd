@@ -593,8 +593,6 @@ main(int argc, char *argv[])
 			err(1, "failed to daemonize");
 	}
 
-	log_init(1);
-
 	if ((cfg = event_config_new()) == NULL)
 		fatalx("event_config_new");
 
