@@ -25,6 +25,8 @@
 #include <stdio.h>
 #include <netdb.h>
 
+#include "sys/tree.h"
+
 #include "config.h"
 
 #define	GRAPHITE_DEFAULT_HOST		"localhost"
