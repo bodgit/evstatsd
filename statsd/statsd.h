@@ -59,11 +59,6 @@ struct statistic {
 	} value;
 };
 
-struct chain {
-	TAILQ_ENTRY(chain)		 entry;
-	struct statistic		*stat;
-};
-
 struct listen_addr {
 	TAILQ_ENTRY(listen_addr)	 entry;
 	struct sockaddr_storage		 sa;
