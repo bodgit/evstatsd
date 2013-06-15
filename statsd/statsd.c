@@ -34,15 +34,6 @@
 
 #include "statsd.h"
 
-#define	STATSD_DEFAULT_STATS_PORT	8125
-#define	STATSD_DEFAULT_HTTP_PORT	8126
-
-#define	STATSD_HASH_SIZE		65535
-
-#define	STATSD_MAX_UDP_PACKET		8192
-
-#define	STATSD_GRAPHITE_CONNECTED	(1 << 0)
-
 struct statistic_dispatch {
 	char	 *path;
 	void	(*single_cb)(struct evhttp_request *, void *);
@@ -50,7 +41,7 @@ struct statistic_dispatch {
 };
 
 __dead void	 usage(void);
-unsigned long	 hash(unsigned char *str);
+int		 statistic_cmp(struct statistic *, struct statistic *);
 void		 stats_timer_cb(int, short, void *);
 void		 stats_connect_cb(struct graphite_connection *, void *);
 void		 stats_disconnect_cb(struct graphite_connection *, void *);
@@ -68,6 +59,9 @@ void		 process_gauge(struct evhttp_request *, void *);
 void		 statsd_read_cb(int, short, void *);
 void		 handle_signal(int, short, void *);
 
+RB_PROTOTYPE(statistics, statistic, entry, statistic_cmp);
+RB_GENERATE(statistics, statistic, entry, statistic_cmp);
+
 struct statistic_dispatch dispatch[STATSD_MAX_TYPE] = {
 	{ "counters", process_counter, process_counter_list },
 	{ "gauges",   process_gauge,   process_gauge_list   }
@@ -82,17 +76,10 @@ usage(void)
 	exit(1);
 }
 
-/* djb2 */
-unsigned long
-hash(unsigned char *str)
+int
+statistic_cmp(struct statistic *s1, struct statistic *s2)
 {
-	unsigned long	 hash = 5381;
-	int		 c;
-
-	while ((c = *str++))
-		hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
-
-	return (hash);
+	return strcmp(s1->metric, s2->metric);
 }
 
 void
@@ -172,8 +159,8 @@ graphite_timer_cb(int fd, short event, void *arg)
 
 	gettimeofday(&tv, NULL);
 
-	for (stat = TAILQ_FIRST(&env->stats); stat;
-	    stat = TAILQ_NEXT(stat, entry)) {
+	for (stat = RB_MIN(statistics, &env->stats); stat;
+	    stat = RB_NEXT(statistics, &env->stats, stat)) {
 		switch (stat->type) {
 		case STATSD_COUNTER:
 			/* FALLTHROUGH */
@@ -207,13 +194,13 @@ process_generic_list(struct evhttp_request *req, void *arg,
 		if ((buf = evbuffer_new()) == NULL)
 			return;
 		evbuffer_add_printf(buf, "[");
-		for (stat = TAILQ_FIRST(&env->stats); stat;
-		    stat = TAILQ_NEXT(stat, entry)) {
+		for (stat = RB_MIN(statistics, &env->stats); stat;
+		    stat = RB_NEXT(statistics, &env->stats, stat)) {
 			/* Not the type we're interested in, next! */
 			if (stat->type != type)
 				continue;
 			evbuffer_add_printf(buf, "\"%s\"", stat->metric);
-			if (TAILQ_NEXT(stat, entry))
+			if (RB_NEXT(statistics, &env->stats, stat))
 				evbuffer_add_printf(buf, ",");
 		}
 		evbuffer_add_printf(buf, "]\n");
@@ -254,22 +241,21 @@ void
 process_generic(struct evhttp_request *req, void *arg,
     enum statistic_type type)
 {
-	struct statsd	*env = (struct statsd *)arg;
-	const char	*metric;
-	struct chain	*chain;
-	struct evbuffer	*buf;
+	struct statsd		*env = (struct statsd *)arg;
+	const char		*metric;
+	struct statistic	*stat;
+	struct evbuffer		*buf;
+	struct statistic	 find;
 
 	/* Metric is the rest of the URL after "/<type>/" */
 	metric = evhttp_uri_get_path(evhttp_request_get_evhttp_uri(req)) +
 	    strlen(dispatch[type].path) + 2;
 
-	for (chain = TAILQ_FIRST(&env->chains[hash((unsigned char *)metric) %
-	    STATSD_HASH_SIZE]); chain &&
-	    strcmp(chain->stat->metric, metric) != 0;
-	    chain = TAILQ_NEXT(chain, entry));
+	find.metric = (char *)metric;
+	stat = RB_FIND(statistics, &env->stats, &find);
 
 	/* Shouldn't ever happen */
-	if (!chain)
+	if (!stat)
 		return;
 
 	switch (evhttp_request_get_command(req)) {
@@ -282,8 +268,7 @@ process_generic(struct evhttp_request *req, void *arg,
 		case STATSD_GAUGE:
 			evbuffer_add_printf(buf,
 			    "{\"name\":\"%s\",\"value\":%Lf,\"last_modified\":%lu}\n",
-			    metric, chain->stat->value.count,
-			    chain->stat->tv.tv_sec);
+			    metric, stat->value.count, stat->tv.tv_sec);
 			break;
 		default:
 			break;
@@ -299,9 +284,7 @@ process_generic(struct evhttp_request *req, void *arg,
 
 		env->count[type]--;
 
-		TAILQ_REMOVE(&env->stats, chain->stat, entry);
-		TAILQ_REMOVE(&env->chains[hash((unsigned char *)metric) %
-		    STATSD_HASH_SIZE], chain, entry);
+		RB_REMOVE(statistics, &env->stats, stat);
 
 		/* Some statistic types may require additional cleanup */
 		switch (type) {
@@ -309,9 +292,8 @@ process_generic(struct evhttp_request *req, void *arg,
 			break;
 		}
 
-		free(chain->stat->metric);
-		free(chain->stat);
-		free(chain);
+		free(stat->metric);
+		free(stat);
 	default:
 		evhttp_add_header(evhttp_request_get_output_headers(req),
 		    "Allow", "GET, DELETE");
@@ -353,8 +335,8 @@ statsd_read_cb(int fd, short event, void *arg)
 	char			*metric;
 	size_t			 length;
 
-	struct statistic	*stat, *nstat;
-	struct chain		*chain, *nchain;
+	struct statistic	 find;
+	struct statistic	*stat;
 
 	char			*path;
 	double			 value;
@@ -422,37 +404,24 @@ statsd_read_cb(int fd, short event, void *arg)
 		/* NOTREACHED */
 	}
 
-	//log_debug("hash(%s) = %lu", metric,
-	//    hash((unsigned char *)metric) % STATSD_HASH_SIZE);
-
-	for (chain = TAILQ_FIRST(&env->chains[hash((unsigned char *)metric) %
-	    STATSD_HASH_SIZE]); chain &&
-	    strcmp(metric, chain->stat->metric) > 0;
-	    chain = TAILQ_NEXT(chain, entry));
+	find.metric = metric;
+	stat = RB_FIND(statistics, &env->stats, &find);
 
 	/* Same metric name, different type */
-	if (chain && strcmp(metric, chain->stat->metric) == 0 &&
-	    chain->stat->type != type) {
+	if (stat && strcmp(metric, stat->metric) == 0 &&
+	    stat->type != type) {
 		log_warnx("Metric %s already exists with different type",
 		    metric);
 		free(metric);
 		return;
 	}
 
-	if (!chain || strcmp(metric, chain->stat->metric)) {
-		log_debug("Hash miss on %s in chain %lu", metric,
-		    hash((unsigned char *)metric) % STATSD_HASH_SIZE);
+	if (!stat) {
+		stat = calloc(1, sizeof(struct statistic));
+		stat->metric = strdup(metric);
+		stat->type = type;
 
-		nstat = calloc(1, sizeof(struct statistic));
-		nstat->metric = strdup(metric);
-		nstat->type = type;
-
-		for (stat = TAILQ_FIRST(&env->stats); stat && strcmp(metric,
-		    stat->metric) > 0; stat = TAILQ_NEXT(stat, entry));
-		if (stat)
-			TAILQ_INSERT_BEFORE(stat, nstat, entry);
-		else
-			TAILQ_INSERT_TAIL(&env->stats, nstat, entry);
+		RB_INSERT(statistics, &env->stats, stat);
 
 		path = calloc(strlen(dispatch[type].path) + strlen(metric) + 3,
 		    sizeof(char));
@@ -461,41 +430,25 @@ statsd_read_cb(int fd, short event, void *arg)
 		    (void *)env);
 		free(path);
 
-		nchain = calloc(1, sizeof(struct chain));
-		nchain->stat = nstat;
-		if (chain) {
-			log_debug("Insert before %s in chain %lu",
-			    chain->stat->metric,
-			    hash((unsigned char *)metric) % STATSD_HASH_SIZE);
-			TAILQ_INSERT_BEFORE(chain, nchain, entry);
-		} else {
-			log_debug("Insert at end of chain %lu",
-			    hash((unsigned char *)metric) % STATSD_HASH_SIZE);
-			TAILQ_INSERT_TAIL(&env->chains[hash((unsigned char *)metric) %
-			    STATSD_HASH_SIZE], nchain, entry);
-		}
-
 		env->count[type]++;
-
-		chain = nchain;
 	}
 
-	switch (chain->stat->type) {
+	switch (stat->type) {
 	case STATSD_COUNTER:
 		/* FALLTHROUGH */
 	case STATSD_GAUGE:
-		if (chain->stat->type == STATSD_COUNTER ||
+		if (stat->type == STATSD_COUNTER ||
 		    (*optr == '+' || *optr == '-'))
-			chain->stat->value.count += value;
+			stat->value.count += value;
 		else
-			chain->stat->value.count = value;
+			stat->value.count = value;
 		break;
 	default:
 		break;
 	}
 
 	/* Record last time this metric was updated */
-	gettimeofday(&chain->stat->tv, NULL);
+	gettimeofday(&stat->tv, NULL);
 
 	free(metric);
 }

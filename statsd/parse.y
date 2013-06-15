@@ -560,7 +560,6 @@ parse_config(const char *filename, int flags)
 	char	 hostname[MAXHOSTNAMELEN];
 	char	*ptr;
 	size_t	 size;
-	int	 i;
 
 	if ((conf = calloc(1, sizeof(*conf))) == NULL) {
 		log_warn("cannot allocate memory");
@@ -568,9 +567,7 @@ parse_config(const char *filename, int flags)
 	}
 
 	TAILQ_INIT(&conf->listen_addrs);
-	TAILQ_INIT(&conf->stats);
-	for (i = 0; i < STATSD_HASH_SIZE; i++)
-		TAILQ_INIT(&conf->chains[i]);
+	RB_INIT(&conf->stats);
 
 	if ((file = pushfile(filename)) == NULL) {
 		free(conf);

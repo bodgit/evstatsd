@@ -39,8 +39,6 @@
 #define	STATSD_DEFAULT_STATS_PORT	8125
 #define	STATSD_DEFAULT_HTTP_PORT	8126
 
-#define	STATSD_HASH_SIZE		65535
-
 #define	STATSD_MAX_UDP_PACKET		8192
 
 #define	STATSD_GRAPHITE_CONNECTED	(1 << 0)
@@ -52,7 +50,7 @@ enum statistic_type {
 };
 
 struct statistic {
-	TAILQ_ENTRY(statistic)		 entry;
+	RB_ENTRY(statistic)		 entry;
 	char				*metric;
 	struct timeval			 tv;
 	enum statistic_type		 type;
@@ -110,8 +108,7 @@ struct statsd {
 
 	struct evhttp				*httpd;
 
-	TAILQ_HEAD(statistics, statistic)	 stats;
-	TAILQ_HEAD(chains, chain)		 chains[STATSD_HASH_SIZE];
+	RB_HEAD(statistics, statistic)		 stats;
 
 	unsigned long long			 count[STATSD_MAX_TYPE];
 };
