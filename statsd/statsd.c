@@ -408,8 +408,7 @@ statsd_read_cb(int fd, short event, void *arg)
 	stat = RB_FIND(statistics, &env->stats, &find);
 
 	/* Same metric name, different type */
-	if (stat && strcmp(metric, stat->metric) == 0 &&
-	    stat->type != type) {
+	if (stat && stat->type != type) {
 		log_warnx("Metric %s already exists with different type",
 		    metric);
 		free(metric);
@@ -456,28 +455,7 @@ statsd_read_cb(int fd, short event, void *arg)
 void
 handle_signal(int sig, short event, void *arg)
 {
-#if 0
-	struct statsd		*env = (struct statsd *)arg;
-	struct statistic	*stat;
-	struct chain		*chain;
-	int			 i;
-#endif
-
 	log_info("exiting on signal %d", sig);
-
-#if 0
-	for (stat = TAILQ_FIRST(&env->stats); stat;
-	    stat = TAILQ_NEXT(stat, entry))
-		log_debug("Metric %s = %Lf", stat->metric, stat->value.count);
-
-	for (i = 0; i < STATSD_HASH_SIZE; i++)
-		if (!TAILQ_EMPTY(&env->chains[i])) {
-			log_debug("env->chains[%d]", i);
-			for (chain = TAILQ_FIRST(&env->chains[i]); chain;
-			    chain = TAILQ_NEXT(chain, entry))
-				log_debug("> %s", chain->stat->metric);
-		}
-#endif
 
 	exit(0);
 }
