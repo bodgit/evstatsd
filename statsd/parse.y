@@ -139,7 +139,7 @@ main		: LISTEN ON address listen_opts	{
 			conf->graphite_host = $2;
 			conf->graphite_port = opts.port;
 			conf->graphite_reconnect.tv_sec = opts.reconnect;
-			conf->stats_interval.tv_sec = opts.interval;
+			conf->graphite_interval.tv_sec = opts.interval;
 		}
 		| STATISTICS STRING stats_opts	{
 			if (conf->stats_host)
