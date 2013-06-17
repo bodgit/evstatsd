@@ -45,17 +45,38 @@
 
 enum statistic_type {
 	STATSD_COUNTER = 0,
+	STATSD_TIMER,
 	STATSD_GAUGE,
+	STATSD_SET,
 	STATSD_MAX_TYPE
 };
 
+struct reading {
+	RB_ENTRY(reading)	 entry;
+	int			 count;
+	long double		 value;
+};
+
+/* Reading the original Etsy statsd source implies these aren't necessarily
+ * coerced into numbers for tracking unique occurrences
+ */
+struct unique {
+	RB_ENTRY(unique)	 entry;
+	char			*value;
+};
+
 struct statistic {
-	RB_ENTRY(statistic)		 entry;
-	char				*metric;
-	struct timeval			 tv;
-	enum statistic_type		 type;
+	RB_ENTRY(statistic)				 entry;
+	char						*metric;
+	struct timeval					 tv;
+	enum statistic_type				 type;
 	union {
-		long double		 count;
+		long double				 count;
+		struct {
+			RB_HEAD(readings, reading)	 readings;
+			unsigned long long		 count;
+		}					 timer;
+		RB_HEAD(uniques, unique)		 uniques;
 	} value;
 };
 
@@ -105,7 +126,12 @@ struct statsd {
 
 	RB_HEAD(statistics, statistic)		 stats;
 
+	/* Statistics */
+	unsigned long long			 bytes_rx;
+	unsigned long long			 packets_rx;
+	unsigned long long			 metrics_rx;
 	unsigned long long			 count[STATSD_MAX_TYPE];
+	struct timeval				 seek_tv;
 };
 
 /* prototypes */

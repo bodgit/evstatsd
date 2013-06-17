@@ -42,6 +42,8 @@ struct statistic_dispatch {
 
 __dead void	 usage(void);
 int		 statistic_cmp(struct statistic *, struct statistic *);
+int		 reading_cmp(struct reading *, struct reading *);
+int		 unique_cmp(struct unique *, struct unique *);
 void		 stats_timer_cb(int, short, void *);
 void		 stats_connect_cb(struct graphite_connection *, void *);
 void		 stats_disconnect_cb(struct graphite_connection *, void *);
@@ -51,20 +53,32 @@ void		 graphite_timer_cb(int, short, void *);
 void		 process_generic_list(struct evhttp_request *, void *,
 		    enum statistic_type);
 void		 process_counter_list(struct evhttp_request *, void *);
+void		 process_timer_list(struct evhttp_request *, void *);
 void		 process_gauge_list(struct evhttp_request *, void *);
+void		 process_set_list(struct evhttp_request *, void *);
 void		 process_generic(struct evhttp_request *, void *,
 		    enum statistic_type);
 void		 process_counter(struct evhttp_request *, void *);
+void		 process_timer(struct evhttp_request *, void *);
 void		 process_gauge(struct evhttp_request *, void *);
+void		 process_set(struct evhttp_request *, void *);
 void		 statsd_read_cb(int, short, void *);
 void		 handle_signal(int, short, void *);
 
 RB_PROTOTYPE(statistics, statistic, entry, statistic_cmp);
 RB_GENERATE(statistics, statistic, entry, statistic_cmp);
 
+RB_PROTOTYPE(readings, reading, entry, reading_cmp);
+RB_GENERATE(readings, reading, entry, reading_cmp);
+
+RB_PROTOTYPE(uniques, unique, entry, unique_cmp);
+RB_GENERATE(uniques, unique, entry, unique_cmp);
+
 struct statistic_dispatch dispatch[STATSD_MAX_TYPE] = {
 	{ "counters", process_counter, process_counter_list },
-	{ "gauges",   process_gauge,   process_gauge_list   }
+	{ "timers",   process_timer,   process_timer_list   },
+	{ "gauges",   process_gauge,   process_gauge_list   },
+	{ "sets",     process_set,     process_set_list     }
 };
 
 __dead void
@@ -79,7 +93,24 @@ usage(void)
 int
 statistic_cmp(struct statistic *s1, struct statistic *s2)
 {
-	return strcmp(s1->metric, s2->metric);
+	return (strcmp(s1->metric, s2->metric));
+}
+
+int
+reading_cmp(struct reading *r1, struct reading *r2)
+{
+	if (r1->value > r2->value)
+		return (1);
+	else if (r1->value < r2->value)
+		return (-1);
+	else
+		return (0);
+}
+
+int
+unique_cmp(struct unique *u1, struct unique *u2)
+{
+	return (strcmp(u1->value, u2->value));
 }
 
 void
@@ -103,7 +134,15 @@ stats_timer_cb(int fd, short event, void *arg)
 	    "graphite.buffer.output", tv, "%zd",
 	    (env->graphite_conn->bev == NULL) ? 0 :
 	    evbuffer_get_length(bufferevent_get_output(env->graphite_conn->bev)));
-
+	graphite_send_metric(env->stats_conn, env->stats_prefix,
+	    "bytes.rx", tv, "%lld", env->bytes_rx);
+	graphite_send_metric(env->stats_conn, env->stats_prefix,
+	    "packets.rx", tv, "%lld", env->packets_rx);
+	graphite_send_metric(env->stats_conn, env->stats_prefix,
+	    "metrics.rx", tv, "%lld", env->metrics_rx);
+	graphite_send_metric(env->stats_conn, env->stats_prefix,
+	    "search.mus", tv, "%lld",
+	    (env->seek_tv.tv_sec * 1000000) + env->seek_tv.tv_usec);
 	for (i = 0; i < STATSD_MAX_TYPE; i++)
 		graphite_send_metric(env->stats_conn, env->stats_prefix,
 		    dispatch[i].path, tv, "%lld", env->count[i]);
@@ -156,6 +195,10 @@ graphite_timer_cb(int fd, short event, void *arg)
 	struct statsd		*env = (struct statsd *)arg;
 	struct statistic	*stat;
 	struct timeval		 tv;
+	struct reading		*r1, *r2;
+	struct unique		*u1, *u2;
+	unsigned long long	 count;
+	long double		 sum, min, max, mean;
 
 	gettimeofday(&tv, NULL);
 
@@ -174,6 +217,75 @@ graphite_timer_cb(int fd, short event, void *arg)
 			}
 			if (stat->type == STATSD_COUNTER)
 				stat->value.count = 0;
+			break;
+		case STATSD_TIMER:
+			count = sum = min = max = mean = 0;
+			if (!RB_EMPTY(&stat->value.timer.readings)) {
+				count = stat->value.timer.count;
+				r1 = RB_MIN(readings,
+				    &stat->value.timer.readings);
+				min = max = r1->value;
+				while (r1 != NULL) {
+					sum += r1->value * r1->count;
+					max = MAX(max, r1->value);
+					r2 = RB_NEXT(readings,
+					    &stat->value.timer.readings, r1);
+					RB_REMOVE(readings,
+					    &stat->value.timer.readings, r1);
+					free(r1);
+					r1 = r2;
+				}
+				mean = sum / count;
+			}
+#if 0
+			/* Necessary? */
+			RB_INIT(&stat->value.readings);
+#endif
+			stat->value.timer.count = 0;
+			log_debug("Sending %s.count = %lld to graphite",
+			    stat->metric, count);
+			log_debug("Sending %s.sum = %Lf to graphite",
+			    stat->metric, sum);
+			log_debug("Sending %s.upper = %Lf to graphite",
+			    stat->metric, max);
+			log_debug("Sending %s.lower = %Lf to graphite",
+			    stat->metric, min);
+			log_debug("Sending %s.mean = %Lf to graphite",
+			    stat->metric, mean);
+			if (env->state & STATSD_GRAPHITE_CONNECTED) {
+				graphite_send_metric(env->graphite_conn,
+				    stat->metric, "count", tv, "%lld", count);
+				graphite_send_metric(env->graphite_conn,
+				    stat->metric, "sum", tv, "%Lf", sum);
+				graphite_send_metric(env->graphite_conn,
+				    stat->metric, "upper", tv, "%Lf", max);
+				graphite_send_metric(env->graphite_conn,
+				    stat->metric, "lower", tv, "%Lf", min);
+				graphite_send_metric(env->graphite_conn,
+				    stat->metric, "mean", tv, "%Lf", mean);
+			}
+			break;
+		case STATSD_SET:
+			count = 0;
+			u1 = RB_MIN(uniques, &stat->value.uniques);
+			while (u1 != NULL) {
+				count++;
+				u2 = RB_NEXT(uniques, &stat->value.uniques, u1);
+				RB_REMOVE(uniques, &stat->value.uniques, u1);
+				free(u1->value);
+				free(u1);
+				u1 = u2;
+			}
+#if 0
+			/* Necessary? */
+			RB_INIT(&stat->value.uniques);
+#endif
+			log_debug("Sending %s.count = %lld to graphite",
+			    stat->metric, count);
+			if (env->state & STATSD_GRAPHITE_CONNECTED) {
+				graphite_send_metric(env->graphite_conn,
+				    stat->metric, "count", tv, "%lld", count);
+			}
 			break;
 		default:
 			break;
@@ -232,9 +344,21 @@ process_counter_list(struct evhttp_request *req, void *arg)
 }
 
 void
+process_timer_list(struct evhttp_request *req, void *arg)
+{
+	process_generic_list(req, arg, STATSD_TIMER);
+}
+
+void
 process_gauge_list(struct evhttp_request *req, void *arg)
 {
 	process_generic_list(req, arg, STATSD_GAUGE);
+}
+
+void
+process_set_list(struct evhttp_request *req, void *arg)
+{
+	process_generic_list(req, arg, STATSD_SET);
 }
 
 void
@@ -246,6 +370,9 @@ process_generic(struct evhttp_request *req, void *arg,
 	struct statistic	*stat;
 	struct evbuffer		*buf;
 	struct statistic	 find;
+	struct reading		*r1, *r2;
+	struct unique		*u1, *u2;
+	int			 i;
 
 	/* Metric is the rest of the URL after "/<type>/" */
 	metric = evhttp_uri_get_path(evhttp_request_get_evhttp_uri(req)) +
@@ -270,7 +397,38 @@ process_generic(struct evhttp_request *req, void *arg,
 			    "{\"name\":\"%s\",\"value\":%Lf,\"last_modified\":%lu}\n",
 			    metric, stat->value.count, stat->tv.tv_sec);
 			break;
+		case STATSD_TIMER:
+			evbuffer_add_printf(buf,
+			    "{\"name\":\"%s\",\"last_modified\":%lu,\"values\":[",
+			    metric, stat->tv.tv_sec);
+			for (r1 = RB_MIN(readings, &stat->value.timer.readings); r1;
+			    r1 = RB_NEXT(readings, &stat->value.timer.readings, r1)) {
+				for (i = 1; i <= r1->count; i++) {
+					evbuffer_add_printf(buf, "%Lf",
+					    r1->value);
+					if (i < r1->count)
+						evbuffer_add_printf(buf, ",");
+				}
+				if (RB_NEXT(readings, &stat->value.timer.readings, r1))
+					evbuffer_add_printf(buf, ",");
+			}
+			evbuffer_add_printf(buf, "]}\n");
+			break;
+		case STATSD_SET:
+			evbuffer_add_printf(buf,
+			    "{\"name\":\"%s\",\"last_modified\":%lu,\"values\":[",
+			    metric, stat->tv.tv_sec);
+			for (u1 = RB_MIN(uniques, &stat->value.uniques); u1;
+			    u1 = RB_NEXT(uniques, &stat->value.uniques, u1)) {
+				evbuffer_add_printf(buf, "\"%s\"", u1->value);
+				if (RB_NEXT(uniques, &stat->value.uniques, u1))
+					evbuffer_add_printf(buf, ",");
+			}
+			evbuffer_add_printf(buf, "]}\n");
+			break;
 		default:
+			/* Shouldn't ever happen, return empty JSON object */
+			evbuffer_add_printf(buf, "{}\n");
 			break;
 		}
 		evhttp_add_header(evhttp_request_get_output_headers(req),
@@ -286,8 +444,30 @@ process_generic(struct evhttp_request *req, void *arg,
 
 		RB_REMOVE(statistics, &env->stats, stat);
 
-		/* Some statistic types may require additional cleanup */
+		/* Some statistic types require additional cleanup */
 		switch (type) {
+		case STATSD_TIMER:
+			r1 = RB_MIN(readings, &stat->value.timer.readings);
+			while (r1 != NULL) {
+				r2 = RB_NEXT(readings,
+				    &stat->value.timer.readings, r1);
+				RB_REMOVE(readings,
+				    &stat->value.timer.readings, r1);
+				free(r1);
+				r1 = r2;
+			}
+			break;
+		case STATSD_SET:
+			u1 = RB_MIN(uniques, &stat->value.uniques);
+			while (u1 != NULL) {
+				u2 = RB_NEXT(uniques, &stat->value.uniques,
+				    u1);
+				RB_REMOVE(uniques, &stat->value.uniques, u1);
+				free(u1->value);
+				free(u1);
+				u1 = u2;
+			}
+			break;
 		default:
 			break;
 		}
@@ -317,9 +497,21 @@ process_counter(struct evhttp_request *req, void *arg)
 }
 
 void
+process_timer(struct evhttp_request *req, void *arg)
+{
+	process_generic(req, arg, STATSD_TIMER);
+}
+
+void
 process_gauge(struct evhttp_request *req, void *arg)
 {
 	process_generic(req, arg, STATSD_GAUGE);
+}
+
+void
+process_set(struct evhttp_request *req, void *arg)
+{
+	process_generic(req, arg, STATSD_SET);
 }
 
 void
@@ -331,16 +523,17 @@ statsd_read_cb(int fd, short event, void *arg)
 	ssize_t			 len;
 	char			 storage[STATSD_MAX_UDP_PACKET];
 	char			*ptr, *optr, *nptr;
-
-	char			*metric;
+	char			*metric = NULL;
 	size_t			 length;
-
 	struct statistic	 find;
 	struct statistic	*stat;
-
 	char			*path;
-	double			 value;
+	double			 value, rate;
 	enum statistic_type	 type;
+	struct timeval		 t0, t1;
+	struct reading		*r1, *r2;
+	struct unique		*u1, *u2;
+	char			*ovalue = NULL;
 
 	bzero(storage, STATSD_MAX_UDP_PACKET);
 	slen = sizeof(ss);
@@ -349,107 +542,204 @@ statsd_read_cb(int fd, short event, void *arg)
 		return;
 
 	//log_debug("Packet received: \"%s\"", storage);
+	env->bytes_rx += len;
+	env->packets_rx++;
+
 	ptr = storage;
-	length = strcspn(ptr, ":");
-	metric = calloc(length + 1, sizeof(char));
-	strncpy(metric, ptr, length);
-	ptr += length;
+	while (*ptr != '\0') {
+		/* Maybe check fo allowable characters instead? */
+		if ((length = strcspn(ptr, ":")) == 0) {
+			log_warnx("No metric");
+			goto bad;
+		}
+		metric = calloc(length + 1, sizeof(char));
+		strncpy(metric, ptr, length);
+		ptr += length;
 
-	if (*ptr != ':') {
-		log_warnx("No ':'");
+		if (*ptr != ':') {
+			log_warnx("No ':'");
+			goto bad;
+		}
+		ptr++;
+
+		/* Remember where the value starts for checking for +/- later */
+		optr = ptr;
+		if (((value = strtod(ptr, &nptr)) == 0) && (nptr == ptr)) {
+			log_warnx("Bad double at %s", ptr);
+			goto bad;
+		}
+
+		if (*nptr != '|') {
+			log_warnx("No '|'");
+			goto bad;
+		}
+
+		/* Thanks to the set type, we need the original string value
+		 * to track for uniqueness rather than parsed into a double
+		 */
+		length = nptr - optr;
+		ovalue = calloc(length + 1, sizeof(char));
+		strncpy(ovalue, optr, length);
+
+		ptr = nptr + 1;
+
+		/* Counter, timer, gauge or set? */
+		length = strspn(ptr, "cgms");
+		if (!strncmp(ptr, "c", length)) {
+			type = STATSD_COUNTER;
+		} else if (!strncmp(ptr, "ms", length)) {
+			type = STATSD_TIMER;
+		} else if (!strncmp(ptr, "g", length)) {
+			type = STATSD_GAUGE;
+		} else if (!strncmp(ptr, "s", length)) {
+			type = STATSD_SET;
+		} else {
+			log_warnx("Invalid type");
+			goto bad;
+		}
+
+		ptr += length;
+
+		/* Only counters and timers support sample rates */
+		rate = 1;
+		if ((type == STATSD_COUNTER || type == STATSD_TIMER) &&
+		    *ptr == '|') {
+			ptr++;
+			if (*ptr != '@') {
+				log_warnx("No '@'");
+				goto bad;
+			}
+			ptr++;
+			if (((rate = strtod(ptr, &nptr)) == 0) && (nptr == ptr)) {
+				log_warnx("Bad double at %s", ptr);
+				goto bad;
+			}
+			ptr = nptr;
+		}
+
+		/* Should now be on either a newline or a null */
+		if (*ptr == '\n')
+			ptr++;
+
+		gettimeofday(&t0, NULL);
+
+		find.metric = metric;
+		stat = RB_FIND(statistics, &env->stats, &find);
+
+		gettimeofday(&t1, NULL);
+
+		/* Track how much time we spend searching for metrics */
+		timersub(&t1, &t0, &t0);
+		timeradd(&env->seek_tv, &t0, &env->seek_tv);
+
+		/* Same metric name, different type */
+		if (stat && stat->type != type) {
+			log_warnx("Metric %s already exists with different type",
+			    metric);
+			free(metric);
+			free(ovalue);
+			metric = ovalue = NULL;
+			continue;
+		}
+
+		env->metrics_rx++;
+
+		if (!stat) {
+			stat = calloc(1, sizeof(struct statistic));
+			stat->metric = strdup(metric);
+			stat->type = type;
+
+			switch (type) {
+			case STATSD_TIMER:
+				RB_INIT(&stat->value.timer.readings);
+				break;
+			case STATSD_SET:
+				RB_INIT(&stat->value.uniques);
+				break;
+			default:
+				break;
+			}
+
+			RB_INSERT(statistics, &env->stats, stat);
+
+			path = calloc(strlen(dispatch[type].path) + strlen(metric) + 3,
+			    sizeof(char));
+			sprintf(path, "/%s/%s", dispatch[type].path, metric);
+			evhttp_set_cb(env->httpd, path, dispatch[type].single_cb,
+			    (void *)env);
+			free(path);
+
+			env->count[type]++;
+		}
+
+		switch (stat->type) {
+		case STATSD_COUNTER:
+			stat->value.count += value * (1 / rate);
+			break;
+		case STATSD_GAUGE:
+			if (*optr == '+' || *optr == '-')
+				stat->value.count += value;
+			else
+				stat->value.count = value;
+			break;
+		case STATSD_TIMER:
+			/* Blame pesky median averages for this */
+			stat->value.timer.count++;
+			r1 = calloc(1, sizeof(struct reading));
+			r1->value = value;
+			r1->count = 1;
+			if ((r2 = RB_INSERT(readings,
+			    &stat->value.timer.readings, r1)) != NULL) {
+				free(r1);
+				r2->count++;
+			}
+			break;
+		case STATSD_SET:
+			u1 = calloc(1, sizeof(struct unique));
+			/* Use the copy of the original value we made */
+			u1->value = ovalue;
+			if ((u2 = RB_INSERT(uniques, &stat->value.uniques,
+			    u1)) != NULL) {
+				log_debug("\"%s\" already in set", value);
+				free(u1->value);
+				free(u1);
+			}
+			break;
+		default:
+			break;
+		}
+
+		/* If this wasn't a set metric, we won't have used this
+		 * copy of the original string value
+		 */
+		if (type != STATSD_SET)
+			free(ovalue);
+		ovalue = NULL;
+
+		/* Record last time this metric was updated */
+		gettimeofday(&stat->tv, NULL);
+
 		free(metric);
-		return;
+
+		continue;
+bad:
+		if (metric) {
+			free(metric);
+			metric = NULL;
+		}
+
+		if (ovalue) {
+			free(ovalue);
+			ovalue = NULL;
+		}
+
+		/* Try and recover to the next metric in a multi-metric
+		 * packet or just fast-forward to the null at the end
+		 */
+		ptr += strcspn(ptr, "\n");
+		if (*ptr == '\n')
+			ptr++;
 	}
-	ptr++;
-
-	/* Remember where the value starts for checking for +/- later */
-	optr = ptr;
-	if (((value = strtod(ptr, &nptr)) == 0) && (nptr == ptr)) {
-		log_warnx("Bad double at %s", ptr);
-		free(metric);
-		return;
-	}
-
-	if (*nptr != '|') {
-		log_warnx("No '|'");
-		free(metric);
-		return;
-	}
-	ptr = nptr + 1;
-
-#if 0
-	/* Counter or gauge? */
-	if ((length = strspn(ptr, "cg")) != 1) {
-		log_warnx("Invalid type");
-		free(metric);
-		return;
-	}
-#endif
-
-	switch (*ptr) {
-	case 'c':
-		type = STATSD_COUNTER;
-		break;
-	case 'g':
-		type = STATSD_GAUGE;
-		break;
-	case 'm':
-		/* FALLTHROUGH */
-	case 's':
-		/* FALLTHROUGH */
-	default:
-		log_warnx("Invalid type");
-		free(metric);
-		return;
-		/* NOTREACHED */
-	}
-
-	find.metric = metric;
-	stat = RB_FIND(statistics, &env->stats, &find);
-
-	/* Same metric name, different type */
-	if (stat && stat->type != type) {
-		log_warnx("Metric %s already exists with different type",
-		    metric);
-		free(metric);
-		return;
-	}
-
-	if (!stat) {
-		stat = calloc(1, sizeof(struct statistic));
-		stat->metric = strdup(metric);
-		stat->type = type;
-
-		RB_INSERT(statistics, &env->stats, stat);
-
-		path = calloc(strlen(dispatch[type].path) + strlen(metric) + 3,
-		    sizeof(char));
-		sprintf(path, "/%s/%s", dispatch[type].path, metric);
-		evhttp_set_cb(env->httpd, path, dispatch[type].single_cb,
-		    (void *)env);
-		free(path);
-
-		env->count[type]++;
-	}
-
-	switch (stat->type) {
-	case STATSD_COUNTER:
-		/* FALLTHROUGH */
-	case STATSD_GAUGE:
-		if (stat->type == STATSD_COUNTER ||
-		    (*optr == '+' || *optr == '-'))
-			stat->value.count += value;
-		else
-			stat->value.count = value;
-		break;
-	default:
-		break;
-	}
-
-	/* Record last time this metric was updated */
-	gettimeofday(&stat->tv, NULL);
-
-	free(metric);
 }
 
 void
